@@ -143,6 +143,9 @@ extern errcode_t io_channel_cache_readahead(io_channel io,
 extern io_manager unix_io_manager;
 extern io_manager unixfd_io_manager;
 
+/* qemu_io.c */
+extern io_manager qemu_io_manager;
+
 /* sparse_io.c */
 extern io_manager sparse_io_manager;
 extern io_manager sparsefd_io_manager;

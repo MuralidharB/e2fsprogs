@@ -11,7 +11,7 @@
 #ifndef _JFS_USER_H
 #define _JFS_USER_H
 
-#ifdef DEBUGFS
+#if defined(DEBUGFS) || defined(QCOW2FS)
 #include <stdio.h>
 #include <stdlib.h>
 #if EXT2_FLAT_INCLUDES
@@ -40,7 +40,7 @@
 #endif
 
 struct buffer_head {
-#ifdef DEBUGFS
+#if defined(DEBUGFS) || defined(QCOW2FS)
 	ext2_filsys	b_fs;
 #else
 	e2fsck_t	b_ctx;
@@ -55,7 +55,7 @@ struct buffer_head {
 };
 
 struct inode {
-#ifdef DEBUGFS
+#if defined(DEBUGFS) || defined(QCOW2FS)
 	ext2_filsys	i_fs;
 #else
 	e2fsck_t	i_ctx;
@@ -65,7 +65,7 @@ struct inode {
 };
 
 struct kdev_s {
-#ifdef DEBUGFS
+#if defined(DEBUGFS) || defined(QCOW2FS)
 	ext2_filsys	k_fs;
 #else
 	e2fsck_t	k_ctx;
@@ -205,7 +205,7 @@ void wait_on_buffer(struct buffer_head *bh);
 #define __getblk(dev, blocknr, blocksize) getblk(dev, blocknr, blocksize)
 #define set_buffer_uptodate(bh) mark_buffer_uptodate(bh, 1)
 
-#ifdef DEBUGFS
+#if defined(DEBUGFS) || defined(QCOW2FS)
 #include <assert.h>
 #undef J_ASSERT
 #define J_ASSERT(x)	assert(x)

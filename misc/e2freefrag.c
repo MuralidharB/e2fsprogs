@@ -379,6 +379,11 @@ static void open_device(char *device_name, ext2_filsys *fs)
 
 void do_freefrag(int argc, char **argv, int sci_idx EXT2FS_ATTR((unused)),
 		 void *infop EXT2FS_ATTR((unused)))
+#elif QCOW2FS
+#include "qcow2fs.h"
+
+void do_freefrag(int argc, char **argv, int sci_idx EXT2FS_ATTR((unused)),
+		 void *infop EXT2FS_ATTR((unused)))
 #else
 int main(int argc, char *argv[])
 #endif
@@ -425,7 +430,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-#ifndef DEBUGFS
+#if !defined(DEBUGFS) && !defined(QCOW2FS)
 	if (optind == argc) {
 		fprintf(stderr, "%s: missing device name.\n", progname);
 		usage(progname);
@@ -444,7 +449,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 	collect_info(fs, &chunk_info, stdout);
-#ifndef DEBUGFS
+#if !defined(DEBUGFS) && !defined(QCOW2FS)
 	close_device(device_name, fs);
 
 	return 0;

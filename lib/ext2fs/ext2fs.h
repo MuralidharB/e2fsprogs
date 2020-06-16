@@ -1742,6 +1742,11 @@ extern int ext2fs_open_file(const char *pathname, int flags, mode_t mode);
 extern int ext2fs_stat(const char *path, ext2fs_struct_stat *buf);
 extern int ext2fs_fstat(int fd, ext2fs_struct_stat *buf);
 
+/* qemu_io.c */
+extern int qcow2_open_file(const char *pathname, int flags, mode_t mode);
+extern int qcow2_stat(const char *path, ext2fs_struct_stat *buf);
+extern int qcow2_fstat(int fd, ext2fs_struct_stat *buf);
+
 /* valid_blk.c */
 extern int ext2fs_inode_has_valid_blocks(struct ext2_inode *inode);
 extern int ext2fs_inode_has_valid_blocks2(ext2_filsys fs,

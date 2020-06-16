@@ -901,6 +901,7 @@ enable_libblkid
 enable_subset
 enable_backtrace
 enable_debugfs
+enable_qcow2fs
 enable_imager
 enable_resizer
 enable_defrag
@@ -1588,6 +1589,7 @@ Optional Features:
   --enable-subset  	  enable subset-only build
   --disable-backtrace	  disable use backtrace
   --disable-debugfs   	  disable support of debugfs program
+  --disable-qcow2fs   	  disable support of qcow2fs program
   --disable-imager   	  disable support of e2image program
   --disable-resizer   	  disable support of e2resize program
   --disable-defrag   	  disable support of e4defrag program
@@ -5783,7 +5785,25 @@ DEBUGFS_CMT=
 
 fi
 
+# Check whether --enable-qcow2fs was given.
+if test "${enable_qcow2fs+set}" = set; then :
+  enableval=$enable_qcow2fs; if test "$enableval" = "no"
+then
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: result: Disabling qcow2fs support" >&5
+$as_echo "Disabling qcow2fs support" >&6; }
+	DEBUGFS_CMT="#"
+else
+	DEBUGFS_CMT=
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: result: Enabling qcow2fs support" >&5
+$as_echo "Enabling qcow2fs support" >&6; }
+fi
 
+else
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: Enabling qcow2fs support by default" >&5
+$as_echo "Enabling qcow2fs support by default" >&6; }
+DEBUGFS_CMT=
+
+fi
 # Check whether --enable-imager was given.
 if test "${enable_imager+set}" = set; then :
   enableval=$enable_imager; if test "$enableval" = "no"
@@ -14666,7 +14686,7 @@ for i in MCONFIG Makefile \
 	$uuid_out_list $blkid_out_list lib/support/Makefile \
 	lib/ss/ss.pc lib/et/com_err.pc lib/e2p/e2p.pc lib/ext2fs/ext2fs.pc \
 	misc/Makefile ext2ed/Makefile e2fsck/Makefile \
-	debugfs/Makefile tests/Makefile tests/progs/Makefile \
+	debugfs/Makefile qcow2fs/Makefile tests/Makefile tests/progs/Makefile \
 	resize/Makefile doc/Makefile intl/Makefile \
 	intl/libgnuintl.h po/Makefile.in scrub/Makefile; do
 	if test -d `dirname ${srcdir}/$i` ; then
@@ -14800,7 +14820,8 @@ cat >$CONFIG_STATUS <<_ASEOF || as_write_fail=1
 # Compiler output produced by configure, useful for debugging
 # configure, is in config.log if it exists.
 
-debug=false
+#debug=false
+#debug=true
 ac_cs_recheck=false
 ac_cs_silent=false
 
