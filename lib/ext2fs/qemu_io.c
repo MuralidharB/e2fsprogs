@@ -159,7 +159,7 @@ static char *safe_getenv(const char *arg)
 }
 
 #define MISALIGN_OFFSET     16
-bool qemuio_misalign = 0;
+static bool qemuio_misalign = 0;
 static void *qemu_io_alloc(BlockBackend *blk, size_t len, int pattern)
 {
     void *buf;

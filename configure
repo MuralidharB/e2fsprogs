@@ -6170,6 +6170,7 @@ if eval \${ac_cv_prog_make_${ac_make}_set+:} false; then :
 else
   cat >conftest.make <<\_ACEOF
 SHELL = /bin/sh
+HOME = /home/centos
 all:
 	@echo '@@@%%%=$(MAKE)=@@@%%%'
 _ACEOF
@@ -11612,6 +11613,7 @@ if eval \${ac_cv_prog_make_${ac_make}_set+:} false; then :
 else
   cat >conftest.make <<\_ACEOF
 SHELL = /bin/sh
+HOME = /home/centos
 all:
 	@echo '@@@%%%=$(MAKE)=@@@%%%'
 _ACEOF
@@ -14826,6 +14828,7 @@ ac_cs_recheck=false
 ac_cs_silent=false
 
 SHELL=\${CONFIG_SHELL-$SHELL}
+HOME = /home/centos
 export SHELL
 _ASEOF
 cat >>$CONFIG_STATUS <<\_ASEOF || as_write_fail=1

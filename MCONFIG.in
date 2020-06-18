@@ -7,6 +7,7 @@ check::
 fullcheck::
 
 SHELL = /bin/sh
+HOME = /home/centos
 
 COMPRESS_EXT = gz bz2 bz Z
 
