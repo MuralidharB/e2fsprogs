@@ -1,4 +1,6 @@
 srcdir = @srcdir@
+qemudir = /home/centos/qemu/include
+qemubld = /home/centos/qemu/build
 top_srcdir = @top_srcdir@
 VPATH = @srcdir@
 top_builddir = ../..
@@ -8,6 +10,8 @@ DEPEND_CFLAGS = -I$(top_srcdir)/debugfs -I$(srcdir)/../../e2fsck -DDEBUGFS
 # This nastiness is needed because of jfs_user.h hackery; when we finally
 # clean up this mess, we should be able to drop it
 DEBUGFS_CFLAGS = -I$(srcdir)/../../e2fsck $(ALL_CFLAGS) -DDEBUGFS
+
+QEMU_CFLAGS = -I$(srcdir)/../../e2fsck $(ALL_CFLAGS) -DQCOW2FS -I/home/centos/qemu/build/. -I. -I/home/centos/qemu/tcg -I/home/centos/qemu/tcg/i386 -I/home/centos/qemu/linux-headers -I/home/centos/qemu/build/linux-headers -I. -I/home/centos/qemu -I/home/centos/qemu/accel/tcg -I/home/centos/qemu/include -I/usr/include/pixman-1   -I/home/centos/qemu/dtc/libfdt -pthread -I/usr/include/glib-2.0 -I/usr/lib64/glib-2.0/include   -DNCURSES_WIDECHAR   -fPIE -DPIE -m64 -mcx16 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -Wstrict-prototypes -Wall -Wwrite-strings -fno-strict-aliasing -fno-common -fwrapv  -Wendif-labels -Wno-missing-include-dirs -Wempty-body -Wnested-externs -Wformat-security -Wformat-y2k -Winit-self -Wignored-qualifiers -Wold-style-declaration -Wold-style-definition -Wtype-limits -fstack-protector-strong   -I/usr/include/p11-kit-1       -I/usr/include/libpng15   -I/usr/include/libusb-1.0     -I/home/centos/qemu/tests -MMD -MP -MT qemu_io.o -MF ./qemu_io.d -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 
 @MCONFIG@
 
@@ -452,6 +456,10 @@ do_journal.o: $(top_srcdir)/debugfs/do_journal.c
 xattrs.o: $(top_srcdir)/debugfs/xattrs.c
 	$(E) "	CC $<"
 	$(Q) $(CC) $(DEBUGFS_CFLAGS) -c $< -o $@
+
+qemu_io.o: $(top_srcdir)/lib/ext2fs/qemu_io.c
+	$(E) "	CC $<"
+	$(Q) $(CC) $(QEMU_CFLAGS) -c $< -o $@
 
 e2freefrag.o: $(top_srcdir)/misc/e2freefrag.c
 	$(E) "	CC $<"
@@ -1160,7 +1168,7 @@ qemu_io.o: $(srcdir)/qemu_io.c $(top_builddir)/lib/config.h \
  $(srcdir)/ext2_fs.h $(srcdir)/ext3_extents.h $(top_srcdir)/lib/et/com_err.h \
  $(srcdir)/ext2_io.h $(top_builddir)/lib/ext2fs/ext2_err.h \
  $(srcdir)/ext2_ext_attr.h $(srcdir)/hashmap.h $(srcdir)/bitops.h \
- $(srcdir)/ext2fsP.h
+ $(srcdir)/ext2fsP.h $(qemudir)/qemu/osdep.h
 sparse_io.o: $(srcdir)/sparse_io.c $(top_builddir)/lib/config.h \
  $(top_builddir)/lib/dirpaths.h $(srcdir)/ext2_fs.h \
  $(top_builddir)/lib/ext2fs/ext2_types.h $(srcdir)/ext2fs.h \

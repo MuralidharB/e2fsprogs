@@ -1,13 +1,13 @@
 /*
  * qemu_io.c --- This is the Unix (well, really POSIX) implementation
- *	of the I/O manager.
+ *    of the I/O manager.
  *
  * Implements a one-block write-through cache.
  *
  * Includes support for Windows NT support under Cygwin.
  *
  * Copyright (C) 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001,
- *	2002 by Theodore Ts'o.
+ *    2002 by Theodore Ts'o.
  *
  * %Begin-Header%
  * This file may be redistributed under the terms of the GNU Library
@@ -78,308 +78,197 @@
 #include "ext2fs.h"
 #include "ext2fsP.h"
 
+#include "qemu/osdep.h"
+#include "sysemu/block-backend.h"
+#include "block/block_int.h"
+#include "qapi/qmp/qbool.h"
+
 /*
  * For checking structure magic numbers...
  */
 
 #define EXT2_CHECK_MAGIC(struct, code) \
-	  if ((struct)->magic != (code)) return (code)
+      if ((struct)->magic != (code)) return (code)
 
 struct unix_cache {
-	char			*buf;
-	unsigned long long	block;
-	int			access_time;
-	unsigned		dirty:1;
-	unsigned		in_use:1;
+    char            *buf;
+    unsigned long long    block;
+    int            access_time;
+    unsigned        dirty:1;
+    unsigned        in_use:1;
 };
 
 #define CACHE_SIZE 8
-#define WRITE_DIRECT_SIZE 4	/* Must be smaller than CACHE_SIZE */
-#define READ_DIRECT_SIZE 4	/* Should be smaller than CACHE_SIZE */
+#define WRITE_DIRECT_SIZE 4    /* Must be smaller than CACHE_SIZE */
+#define READ_DIRECT_SIZE 4    /* Should be smaller than CACHE_SIZE */
 
 struct unix_private_data {
-	int	magic;
-        //BlockBackend *blk;
-        int     dev;
-	int	flags;
-	int	align;
-	int	access_time;
-	ext2_loff_t offset;
-	struct unix_cache cache[CACHE_SIZE];
-	void	*bounce;
-	struct struct_io_stats io_stats;
+    int    magic;
+    BlockBackend *blk;
+    int    flags;
+    int    align;
+    int    access_time;
+    ext2_loff_t offset;
+    struct unix_cache cache[CACHE_SIZE];
+    void    *bounce;
+    struct struct_io_stats io_stats;
 };
 
 #define IS_ALIGNED(n, align) ((((uintptr_t) n) & \
-			       ((uintptr_t) ((align)-1))) == 0)
+                   ((uintptr_t) ((align)-1))) == 0)
+
+static BlockBackend *qemuio_blk;
 
 static errcode_t qemu_get_stats(io_channel channel, io_stats *stats)
 {
-	errcode_t	retval = 0;
+    errcode_t    retval = 0;
 
-	struct unix_private_data *data;
+    struct unix_private_data *data;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (stats)
-		*stats = &data->io_stats;
+    if (stats)
+        *stats = &data->io_stats;
 
-	return retval;
+    return retval;
 }
 
 static char *safe_getenv(const char *arg)
 {
-	if ((getuid() != geteuid()) || (getgid() != getegid()))
-		return NULL;
+    if ((getuid() != geteuid()) || (getgid() != getegid()))
+        return NULL;
 #ifdef HAVE_PRCTL
-	if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
-		return NULL;
+    if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
+        return NULL;
 #else
 #if (defined(linux) && defined(SYS_prctl))
-	if (syscall(SYS_prctl, PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
-		return NULL;
+    if (syscall(SYS_prctl, PR_GET_DUMPABLE, 0, 0, 0, 0) == 0)
+        return NULL;
 #endif
 #endif
 
 #if defined(HAVE_SECURE_GETENV)
-	return secure_getenv(arg);
+    return secure_getenv(arg);
 #elif defined(HAVE___SECURE_GETENV)
-	return __secure_getenv(arg);
+    return __secure_getenv(arg);
 #else
-	return getenv(arg);
+    return getenv(arg);
 #endif
 }
 
+#define MISALIGN_OFFSET     16
+bool qemuio_misalign = 0;
+static void *qemu_io_alloc(BlockBackend *blk, size_t len, int pattern)
+{
+    void *buf;
+
+    if (qemuio_misalign) {
+        len += MISALIGN_OFFSET;
+    }
+    buf = blk_blockalign(blk, len);
+    memset(buf, pattern, len);
+    if (qemuio_misalign) {
+        buf += MISALIGN_OFFSET;
+    }
+    return buf;
+}
+
+static void qemu_io_free(void *p)
+{
+    if (qemuio_misalign) {
+        p -= MISALIGN_OFFSET;
+    }
+    qemu_vfree(p);
+}
+
+static int do_pread(BlockBackend *blk, const unsigned char *buf, int64_t offset,
+                    int64_t bytes, int64_t *total)
+{
+    if (bytes > INT_MAX) {
+        return -ERANGE;
+    }
+
+    *total = blk_pread(blk, offset, (uint8_t *)buf, bytes);
+    if (*total < 0) {
+        return *total;
+    }
+    return 1;
+}
+
+static int do_pwrite(BlockBackend *blk, const unsigned char *buf, int64_t offset,
+                     int64_t bytes, int flags, int64_t *total)
+{
+    if (bytes > INT_MAX) {
+        return -ERANGE;
+    }
+
+    *total = blk_pwrite(blk, offset, (uint8_t *)buf, bytes, flags);
+    if (*total < 0) {
+        return *total;
+    }
+    return 1;
+}
 /*
  * Here are the raw I/O functions
  */
 static errcode_t raw_read_blk(io_channel channel,
-			      struct unix_private_data *data,
-			      unsigned long long block,
-			      int count, void *bufv)
+                  struct unix_private_data *data,
+                  unsigned long long block,
+                  int count, void *bufv)
 {
-	errcode_t	retval;
-	ssize_t		size;
-	ext2_loff_t	location;
-	int		actual = 0;
-	unsigned char	*buf = bufv;
-	ssize_t		really_read = 0;
+    errcode_t     retval;
+    ext2_loff_t    location;
+    ssize_t       size;
+    unsigned char *buf = bufv;
+    int64_t       total;
 
-	size = (count < 0) ? -count : (ext2_loff_t) count * channel->block_size;
-	data->io_stats.bytes_read += size;
-	location = ((ext2_loff_t) block * channel->block_size) + data->offset;
+    size = (count < 0) ? -count : (ext2_loff_t) count * channel->block_size;
+    data->io_stats.bytes_read += size;
+    location = ((ext2_loff_t) block * channel->block_size) + data->offset;
 
-	if (data->flags & IO_FLAG_FORCE_BOUNCE) {
-		if (ext2fs_llseek(data->dev, location, SEEK_SET) != location) {
-			retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
-			goto error_out;
-		}
-		goto bounce_read;
-	}
+    buf = qemu_io_alloc(data->blk, count, 0xab);
 
-#ifdef HAVE_PREAD64
-	/* Try an aligned pread */
-	if ((channel->align == 0) ||
-	    (IS_ALIGNED(buf, channel->align) &&
-	     IS_ALIGNED(size, channel->align))) {
-		actual = pread64(data->dev, buf, size, location);
-		if (actual == size)
-			return 0;
-		actual = 0;
-	}
-#elif HAVE_PREAD
-	/* Try an aligned pread */
-	if ((sizeof(off_t) >= sizeof(ext2_loff_t)) &&
-	    ((channel->align == 0) ||
-	     (IS_ALIGNED(buf, channel->align) &&
-	      IS_ALIGNED(size, channel->align)))) {
-		actual = pread(data->dev, buf, size, location);
-		if (actual == size)
-			return 0;
-		actual = 0;
-	}
-#endif /* HAVE_PREAD */
+    retval = do_pread(data->blk, buf, location, count, &total);
 
-	if (ext2fs_llseek(data->dev, location, SEEK_SET) != location) {
-		retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
-		goto error_out;
-	}
-	if ((channel->align == 0) ||
-	    (IS_ALIGNED(buf, channel->align) &&
-	     IS_ALIGNED(size, channel->align))) {
-		actual = read(data->dev, buf, size);
-		if (actual != size) {
-		short_read:
-			if (actual < 0) {
-				retval = errno;
-				actual = 0;
-			} else
-				retval = EXT2_ET_SHORT_READ;
-			goto error_out;
-		}
-		return 0;
-	}
+    if (retval < 0) {
+        printf("read failed: %s\n", strerror(-retval));
+        goto out;
+    }
 
-#ifdef ALIGN_DEBUG
-	printf("raw_read_blk: O_DIRECT fallback: %p %lu\n", buf,
-	       (unsigned long) size);
-#endif
+out:
+    qemu_io_free(buf);
 
-	/*
-	 * The buffer or size which we're trying to read isn't aligned
-	 * to the O_DIRECT rules, so we need to do this the hard way...
-	 */
-bounce_read:
-	while (size > 0) {
-		actual = read(data->dev, data->bounce, channel->block_size);
-		if (actual != channel->block_size) {
-			actual = really_read;
-			buf -= really_read;
-			size += really_read;
-			goto short_read;
-		}
-		actual = size;
-		if (size > channel->block_size)
-			actual = channel->block_size;
-		memcpy(buf, data->bounce, actual);
-		really_read += actual;
-		size -= actual;
-		buf += actual;
-	}
-	return 0;
-
-error_out:
-	if (actual >= 0 && actual < size)
-		memset((char *) buf+actual, 0, size-actual);
-	if (channel->read_error)
-		retval = (channel->read_error)(channel, block, count, buf,
-					       size, actual, retval);
-	return retval;
+    return 0;
+    return retval;
 }
 
 static errcode_t raw_write_blk(io_channel channel,
-			       struct unix_private_data *data,
-			       unsigned long long block,
-			       int count, const void *bufv)
+                   struct unix_private_data *data,
+                   unsigned long long block,
+                   int count, const void *bufv)
 {
-	ssize_t		size;
-	ext2_loff_t	location;
-	int		actual = 0;
-	errcode_t	retval;
-	const unsigned char *buf = bufv;
+    ssize_t        size, total;
+    ext2_loff_t    location;
+    errcode_t    retval;
+    const unsigned char *buf = bufv;
 
-	if (count == 1)
-		size = channel->block_size;
-	else {
-		if (count < 0)
-			size = -count;
-		else
-			size = (ext2_loff_t) count * channel->block_size;
-	}
-	data->io_stats.bytes_written += size;
+    if (count == 1)
+        size = channel->block_size;
+    else {
+        if (count < 0)
+            size = -count;
+        else
+            size = (ext2_loff_t) count * channel->block_size;
+    }
+    data->io_stats.bytes_written += size;
 
-	location = ((ext2_loff_t) block * channel->block_size) + data->offset;
+    location = ((ext2_loff_t) block * channel->block_size) + data->offset;
 
-	if (data->flags & IO_FLAG_FORCE_BOUNCE) {
-		if (ext2fs_llseek(data->dev, location, SEEK_SET) != location) {
-			retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
-			goto error_out;
-		}
-		goto bounce_write;
-	}
+    retval = do_pwrite(data->blk, buf, location, size, 0, &total);
 
-#ifdef HAVE_PWRITE64
-	/* Try an aligned pwrite */
-	if ((channel->align == 0) ||
-	    (IS_ALIGNED(buf, channel->align) &&
-	     IS_ALIGNED(size, channel->align))) {
-		actual = pwrite64(data->dev, buf, size, location);
-		if (actual == size)
-			return 0;
-	}
-#elif HAVE_PWRITE
-	/* Try an aligned pwrite */
-	if ((sizeof(off_t) >= sizeof(ext2_loff_t)) &&
-	    ((channel->align == 0) ||
-	     (IS_ALIGNED(buf, channel->align) &&
-	      IS_ALIGNED(size, channel->align)))) {
-		actual = pwrite(data->dev, buf, size, location);
-		if (actual == size)
-			return 0;
-	}
-#endif /* HAVE_PWRITE */
-
-	if (ext2fs_llseek(data->dev, location, SEEK_SET) != location) {
-		retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
-		goto error_out;
-	}
-
-	if ((channel->align == 0) ||
-	    (IS_ALIGNED(buf, channel->align) &&
-	     IS_ALIGNED(size, channel->align))) {
-		actual = write(data->dev, buf, size);
-		if (actual < 0) {
-			retval = errno;
-			goto error_out;
-		}
-		if (actual != size) {
-		short_write:
-			retval = EXT2_ET_SHORT_WRITE;
-			goto error_out;
-		}
-		return 0;
-	}
-
-#ifdef ALIGN_DEBUG
-	printf("raw_write_blk: O_DIRECT fallback: %p %lu\n", buf,
-	       (unsigned long) size);
-#endif
-	/*
-	 * The buffer or size which we're trying to write isn't aligned
-	 * to the O_DIRECT rules, so we need to do this the hard way...
-	 */
-bounce_write:
-	while (size > 0) {
-		if (size < channel->block_size) {
-			actual = read(data->dev, data->bounce,
-				      channel->block_size);
-			if (actual != channel->block_size) {
-				if (actual < 0) {
-					retval = errno;
-					goto error_out;
-				}
-				memset((char *) data->bounce + actual, 0,
-				       channel->block_size - actual);
-			}
-		}
-		actual = size;
-		if (size > channel->block_size)
-			actual = channel->block_size;
-		memcpy(data->bounce, buf, actual);
-		if (ext2fs_llseek(data->dev, location, SEEK_SET) != location) {
-			retval = errno ? errno : EXT2_ET_LLSEEK_FAILED;
-			goto error_out;
-		}
-		actual = write(data->dev, data->bounce, channel->block_size);
-		if (actual < 0) {
-			retval = errno;
-			goto error_out;
-		}
-		if (actual != channel->block_size)
-			goto short_write;
-		size -= actual;
-		buf += actual;
-		location += actual;
-	}
-	return 0;
-
-error_out:
-	if (channel->write_error)
-		retval = (channel->write_error)(channel, block, count, buf,
-						size, actual, retval);
-	return retval;
+    return retval;
 }
 
 
@@ -389,49 +278,49 @@ error_out:
 
 /* Allocate the cache buffers */
 static errcode_t alloc_cache(io_channel channel,
-			     struct unix_private_data *data)
+                 struct unix_private_data *data)
 {
-	errcode_t		retval;
-	struct unix_cache	*cache;
-	int			i;
+    errcode_t        retval;
+    struct unix_cache    *cache;
+    int            i;
 
-	data->access_time = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
-		cache->block = 0;
-		cache->access_time = 0;
-		cache->dirty = 0;
-		cache->in_use = 0;
-		if (cache->buf)
-			ext2fs_free_mem(&cache->buf);
-		retval = io_channel_alloc_buf(channel, 0, &cache->buf);
-		if (retval)
-			return retval;
-	}
-	if (channel->align || data->flags & IO_FLAG_FORCE_BOUNCE) {
-		if (data->bounce)
-			ext2fs_free_mem(&data->bounce);
-		retval = io_channel_alloc_buf(channel, 0, &data->bounce);
-	}
-	return retval;
+    data->access_time = 0;
+    for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+        cache->block = 0;
+        cache->access_time = 0;
+        cache->dirty = 0;
+        cache->in_use = 0;
+        if (cache->buf)
+            ext2fs_free_mem(&cache->buf);
+        retval = io_channel_alloc_buf(channel, 0, &cache->buf);
+        if (retval)
+            return retval;
+    }
+    if (channel->align || data->flags & IO_FLAG_FORCE_BOUNCE) {
+        if (data->bounce)
+            ext2fs_free_mem(&data->bounce);
+        retval = io_channel_alloc_buf(channel, 0, &data->bounce);
+    }
+    return retval;
 }
 
 /* Free the cache buffers */
 static void free_cache(struct unix_private_data *data)
 {
-	struct unix_cache	*cache;
-	int			i;
+    struct unix_cache    *cache;
+    int            i;
 
-	data->access_time = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
-		cache->block = 0;
-		cache->access_time = 0;
-		cache->dirty = 0;
-		cache->in_use = 0;
-		if (cache->buf)
-			ext2fs_free_mem(&cache->buf);
-	}
-	if (data->bounce)
-		ext2fs_free_mem(&data->bounce);
+    data->access_time = 0;
+    for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+        cache->block = 0;
+        cache->access_time = 0;
+        cache->dirty = 0;
+        cache->in_use = 0;
+        if (cache->buf)
+            ext2fs_free_mem(&cache->buf);
+    }
+    if (data->bounce)
+        ext2fs_free_mem(&data->bounce);
 }
 
 #ifndef NO_IO_CACHE
@@ -441,78 +330,78 @@ static void free_cache(struct unix_private_data *data)
  * entry to that should be reused.
  */
 static struct unix_cache *find_cached_block(struct unix_private_data *data,
-					    unsigned long long block,
-					    struct unix_cache **eldest)
+                        unsigned long long block,
+                        struct unix_cache **eldest)
 {
-	struct unix_cache	*cache, *unused_cache, *oldest_cache;
-	int			i;
+    struct unix_cache    *cache, *unused_cache, *oldest_cache;
+    int            i;
 
-	unused_cache = oldest_cache = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
-		if (!cache->in_use) {
-			if (!unused_cache)
-				unused_cache = cache;
-			continue;
-		}
-		if (cache->block == block) {
-			cache->access_time = ++data->access_time;
-			return cache;
-		}
-		if (!oldest_cache ||
-		    (cache->access_time < oldest_cache->access_time))
-			oldest_cache = cache;
-	}
-	if (eldest)
-		*eldest = (unused_cache) ? unused_cache : oldest_cache;
-	return 0;
+    unused_cache = oldest_cache = 0;
+    for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+        if (!cache->in_use) {
+            if (!unused_cache)
+                unused_cache = cache;
+            continue;
+        }
+        if (cache->block == block) {
+            cache->access_time = ++data->access_time;
+            return cache;
+        }
+        if (!oldest_cache ||
+            (cache->access_time < oldest_cache->access_time))
+            oldest_cache = cache;
+    }
+    if (eldest)
+        *eldest = (unused_cache) ? unused_cache : oldest_cache;
+    return 0;
 }
 
 /*
  * Reuse a particular cache entry for another block.
  */
 static void reuse_cache(io_channel channel, struct unix_private_data *data,
-		 struct unix_cache *cache, unsigned long long block)
+         struct unix_cache *cache, unsigned long long block)
 {
-	if (cache->dirty && cache->in_use)
-		raw_write_blk(channel, data, cache->block, 1, cache->buf);
+    if (cache->dirty && cache->in_use)
+        raw_write_blk(channel, data, cache->block, 1, cache->buf);
 
-	cache->in_use = 1;
-	cache->dirty = 0;
-	cache->block = block;
-	cache->access_time = ++data->access_time;
+    cache->in_use = 1;
+    cache->dirty = 0;
+    cache->block = block;
+    cache->access_time = ++data->access_time;
 }
 
 /*
  * Flush all of the blocks in the cache
  */
 static errcode_t flush_cached_blocks(io_channel channel,
-				     struct unix_private_data *data,
-				     int invalidate)
+                     struct unix_private_data *data,
+                     int invalidate)
 
 {
-	struct unix_cache	*cache;
-	errcode_t		retval, retval2;
-	int			i;
+    struct unix_cache    *cache;
+    errcode_t        retval, retval2;
+    int            i;
 
-	retval2 = 0;
-	for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
-		if (!cache->in_use)
-			continue;
+    retval2 = 0;
+    for (i=0, cache = data->cache; i < CACHE_SIZE; i++, cache++) {
+        if (!cache->in_use)
+            continue;
 
-		if (invalidate)
-			cache->in_use = 0;
+        if (invalidate)
+            cache->in_use = 0;
 
-		if (!cache->dirty)
-			continue;
+        if (!cache->dirty)
+            continue;
 
-		retval = raw_write_blk(channel, data,
-				       cache->block, 1, cache->buf);
-		if (retval)
-			retval2 = retval;
-		else
-			cache->dirty = 0;
-	}
-	return retval2;
+        retval = raw_write_blk(channel, data,
+                       cache->block, 1, cache->buf);
+        if (retval)
+            retval2 = retval;
+        else
+            cache->dirty = 0;
+    }
+    return retval2;
 }
 #endif /* NO_IO_CACHE */
 
@@ -524,510 +413,446 @@ static errcode_t flush_cached_blocks(io_channel channel,
 
 int qcow2fs_open_file(const char *pathname, int flags, mode_t mode)
 {
-	if (mode)
-#if defined(HAVE_OPEN64) && !defined(__OSX_AVAILABLE_BUT_DEPRECATED)
-		return open64(pathname, flags, mode);
-	else
-		return open64(pathname, flags);
-#else
-		return open(pathname, flags, mode);
-	else
-		return open(pathname, flags);
-#endif
+    Error *local_err = NULL;
+    QDict *opts;
+
+    if (qemuio_blk) {
+        return 1;
+    }
+
+    opts = qdict_new();
+    if (qdict_haskey(opts, BDRV_OPT_FORCE_SHARE)
+        && !qdict_get_bool(opts, BDRV_OPT_FORCE_SHARE)) {
+        QDECREF(opts);
+        return 1;
+    }
+    qdict_put_bool(opts, BDRV_OPT_FORCE_SHARE, true);
+
+    qemuio_blk = blk_new_open(pathname, NULL, opts, flags, &local_err);
+    if (!qemuio_blk) {
+        QDECREF(opts);
+        return 1;
+    }
+
+    blk_set_enable_write_cache(qemuio_blk, true);
+
+    QDECREF(opts);
+    return 0;
 }
 
 int qcow2fs_stat(const char *path, ext2fs_struct_stat *buf)
 {
 #if defined(HAVE_FSTAT64) && !defined(__OSX_AVAILABLE_BUT_DEPRECATED)
-	return stat64(path, buf);
+    return stat64(path, buf);
 #else
-	return stat(path, buf);
+    return stat(path, buf);
 #endif
 }
 
-int qcow2fs_fstat(int fd, ext2fs_struct_stat *buf)
+int qcow2fs_fstat(BlockBackend *blk, ext2fs_struct_stat *buf)
 {
-#if defined(HAVE_FSTAT64) && !defined(__OSX_AVAILABLE_BUT_DEPRECATED)
-	return fstat64(fd, buf);
-#else
-	return fstat(fd, buf);
-#endif
+     return 0;
 }
 
+static errcode_t qemu_close1(io_channel channel);
 
-static errcode_t unix_open_channel(const char *name, int fd,
-				   int flags, io_channel *channel,
-				   io_manager io_mgr)
+static errcode_t unix_open_channel(const char *name,
+                   BlockBackend *blk,
+                   int flags, io_channel *channel,
+                   io_manager io_mgr)
 {
-	io_channel	io = NULL;
-	struct unix_private_data *data = NULL;
-	errcode_t	retval;
-	ext2fs_struct_stat st;
+    io_channel    io = NULL;
+    struct unix_private_data *data = NULL;
+    errcode_t    retval;
+    ext2fs_struct_stat st;
 #ifdef __linux__
-	struct		utsname ut;
+    struct        utsname ut;
 #endif
 
-	if (safe_getenv("UNIX_IO_FORCE_BOUNCE"))
-		flags |= IO_FLAG_FORCE_BOUNCE;
+    if (safe_getenv("UNIX_IO_FORCE_BOUNCE"))
+        flags |= IO_FLAG_FORCE_BOUNCE;
 
-#ifdef __linux__
-	/*
-	 * We need to make sure any previous errors in the block
-	 * device are thrown away, sigh.
-	 */
-	(void) fsync(fd);
+    retval = ext2fs_get_mem(sizeof(struct struct_io_channel), &io);
+    if (retval)
+        goto cleanup;
+    memset(io, 0, sizeof(struct struct_io_channel));
+    io->magic = EXT2_ET_MAGIC_IO_CHANNEL;
+    retval = ext2fs_get_mem(sizeof(struct unix_private_data), &data);
+    if (retval)
+        goto cleanup;
+
+    io->manager = io_mgr;
+    retval = ext2fs_get_mem(strlen(name)+1, &io->name);
+    if (retval)
+        goto cleanup;
+
+    strcpy(io->name, name);
+    io->private_data = data;
+    io->block_size = 1024;
+    io->read_error = 0;
+    io->write_error = 0;
+    io->refcount = 1;
+
+    memset(data, 0, sizeof(struct unix_private_data));
+    data->magic = EXT2_ET_MAGIC_UNIX_IO_CHANNEL;
+    data->io_stats.num_fields = 2;
+    data->flags = flags;
+    data->blk =blk;
+
+#if defined(F_NOCACHE)
+    if (flags & IO_FLAG_DIRECT_IO)
+        io->align = 4096;
 #endif
 
-	retval = ext2fs_get_mem(sizeof(struct struct_io_channel), &io);
-	if (retval)
-		goto cleanup;
-	memset(io, 0, sizeof(struct struct_io_channel));
-	io->magic = EXT2_ET_MAGIC_IO_CHANNEL;
-	retval = ext2fs_get_mem(sizeof(struct unix_private_data), &data);
-	if (retval)
-		goto cleanup;
+    /*
+     * If the device is really a block device, then set the
+     * appropriate flag, otherwise we can set DISCARD_ZEROES flag
+     * because we are going to use punch hole instead of discard
+     * and if it succeed, subsequent read from sparse area returns
+     * zero.
+     */
+    if (qcow2fs_fstat(data->blk, &st) == 0) {
+        if (ext2fsP_is_disk_device(st.st_mode))
+            io->flags |= CHANNEL_FLAGS_BLOCK_DEVICE;
+        else
+            io->flags |= CHANNEL_FLAGS_DISCARD_ZEROES;
+    }
 
-	io->manager = io_mgr;
-	retval = ext2fs_get_mem(strlen(name)+1, &io->name);
-	if (retval)
-		goto cleanup;
-
-	strcpy(io->name, name);
-	io->private_data = data;
-	io->block_size = 1024;
-	io->read_error = 0;
-	io->write_error = 0;
-	io->refcount = 1;
-
-	memset(data, 0, sizeof(struct unix_private_data));
-	data->magic = EXT2_ET_MAGIC_UNIX_IO_CHANNEL;
-	data->io_stats.num_fields = 2;
-	data->flags = flags;
-	data->dev = fd;
-
-#if defined(O_DIRECT)
-	if (flags & IO_FLAG_DIRECT_IO)
-		io->align = ext2fs_get_dio_alignment(data->dev);
-#elif defined(F_NOCACHE)
-	if (flags & IO_FLAG_DIRECT_IO)
-		io->align = 4096;
-#endif
-
-	/*
-	 * If the device is really a block device, then set the
-	 * appropriate flag, otherwise we can set DISCARD_ZEROES flag
-	 * because we are going to use punch hole instead of discard
-	 * and if it succeed, subsequent read from sparse area returns
-	 * zero.
-	 */
-	if (qcow2fs_fstat(data->dev, &st) == 0) {
-		if (ext2fsP_is_disk_device(st.st_mode))
-			io->flags |= CHANNEL_FLAGS_BLOCK_DEVICE;
-		else
-			io->flags |= CHANNEL_FLAGS_DISCARD_ZEROES;
-	}
-
-#ifdef BLKDISCARDZEROES
-	{
-		int zeroes = 0;
-		if (ioctl(data->dev, BLKDISCARDZEROES, &zeroes) == 0 &&
-		    zeroes)
-			io->flags |= CHANNEL_FLAGS_DISCARD_ZEROES;
-	}
-#endif
 
 #if defined(__CYGWIN__)
-	/*
-	 * Some operating systems require that the buffers be aligned,
-	 * regardless of O_DIRECT
-	 */
-	if (!io->align)
-		io->align = 512;
+    /*
+     * Some operating systems require that the buffers be aligned,
+     * regardless of O_DIRECT
+     */
+    if (!io->align)
+        io->align = 512;
 #endif
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-	if (io->flags & CHANNEL_FLAGS_BLOCK_DEVICE) {
-		int dio_align = ext2fs_get_dio_alignment(fd);
+    if (io->flags & CHANNEL_FLAGS_BLOCK_DEVICE) {
+        int dio_align = ext2fs_get_dio_alignment(fd);
 
-		if (io->align < dio_align)
-			io->align = dio_align;
-	}
+        if (io->align < dio_align)
+            io->align = dio_align;
+    }
 #endif
 
-	if ((retval = alloc_cache(io, data)))
-		goto cleanup;
+    if ((retval = alloc_cache(io, data)))
+        goto cleanup;
 
-#ifdef BLKROGET
-	if (flags & IO_FLAG_RW) {
-		int error;
-		int readonly = 0;
-
-		/* Is the block device actually writable? */
-		error = ioctl(data->dev, BLKROGET, &readonly);
-		if (!error && readonly) {
-			retval = EPERM;
-			goto cleanup;
-		}
-	}
-#endif
 
 #ifdef __linux__
 #undef RLIM_INFINITY
 #if (defined(__alpha__) || ((defined(__sparc__) || defined(__mips__)) && (SIZEOF_LONG == 4)))
-#define RLIM_INFINITY	((unsigned long)(~0UL>>1))
+#define RLIM_INFINITY    ((unsigned long)(~0UL>>1))
 #else
 #define RLIM_INFINITY  (~0UL)
 #endif
-	/*
-	 * Work around a bug in 2.4.10-2.4.18 kernels where writes to
-	 * block devices are wrongly getting hit by the filesize
-	 * limit.  This workaround isn't perfect, since it won't work
-	 * if glibc wasn't built against 2.2 header files.  (Sigh.)
-	 *
-	 */
-	if ((flags & IO_FLAG_RW) &&
-	    (uname(&ut) == 0) &&
-	    ((ut.release[0] == '2') && (ut.release[1] == '.') &&
-	     (ut.release[2] == '4') && (ut.release[3] == '.') &&
-	     (ut.release[4] == '1') && (ut.release[5] >= '0') &&
-	     (ut.release[5] < '8')) &&
-	    (qcow2fs_fstat(data->dev, &st) == 0) &&
-	    (ext2fsP_is_disk_device(st.st_mode))) {
-		struct rlimit	rlim;
+    /*
+     * Work around a bug in 2.4.10-2.4.18 kernels where writes to
+     * block devices are wrongly getting hit by the filesize
+     * limit.  This workaround isn't perfect, since it won't work
+     * if glibc wasn't built against 2.2 header files.  (Sigh.)
+     *
+     */
+    if ((flags & IO_FLAG_RW) &&
+        (uname(&ut) == 0) &&
+        ((ut.release[0] == '2') && (ut.release[1] == '.') &&
+         (ut.release[2] == '4') && (ut.release[3] == '.') &&
+         (ut.release[4] == '1') && (ut.release[5] >= '0') &&
+         (ut.release[5] < '8')) &&
+        (qcow2fs_fstat(data->blk, &st) == 0) &&
+        (ext2fsP_is_disk_device(st.st_mode))) {
+        struct rlimit    rlim;
 
-		rlim.rlim_cur = rlim.rlim_max = (unsigned long) RLIM_INFINITY;
-		setrlimit(RLIMIT_FSIZE, &rlim);
-		getrlimit(RLIMIT_FSIZE, &rlim);
-		if (((unsigned long) rlim.rlim_cur) <
-		    ((unsigned long) rlim.rlim_max)) {
-			rlim.rlim_cur = rlim.rlim_max;
-			setrlimit(RLIMIT_FSIZE, &rlim);
-		}
-	}
+        rlim.rlim_cur = rlim.rlim_max = (unsigned long) RLIM_INFINITY;
+        setrlimit(RLIMIT_FSIZE, &rlim);
+        getrlimit(RLIMIT_FSIZE, &rlim);
+        if (((unsigned long) rlim.rlim_cur) <
+            ((unsigned long) rlim.rlim_max)) {
+            rlim.rlim_cur = rlim.rlim_max;
+            setrlimit(RLIMIT_FSIZE, &rlim);
+        }
+    }
 #endif
-	*channel = io;
-	return 0;
+    *channel = io;
+    return 0;
 
 cleanup:
-	if (data) {
-		if (data->dev >= 0)
-			close(data->dev);
-		free_cache(data);
-		ext2fs_free_mem(&data);
-	}
-	if (io) {
-		if (io->name) {
-			ext2fs_free_mem(&io->name);
-		}
-		ext2fs_free_mem(&io);
-	}
-	return retval;
+    if (data) {
+        free_cache(data);
+        ext2fs_free_mem(&data);
+    }
+    if (io) {
+        if (io->name) {
+            ext2fs_free_mem(&io->name);
+        }
+        ext2fs_free_mem(&io);
+    }
+    return retval;
 }
 
-static errcode_t unixfd_open(const char *str_fd, int flags,
-			     io_channel *channel)
+static errcode_t qemu_open1(const char *name, int flags,
+               io_channel *channel)
 {
-	int fd;
-	int fd_flags;
+    int open_flags;
+    int errno;
 
-	fd = atoi(str_fd);
-#if defined(HAVE_FCNTL)
-	fd_flags = fcntl(fd, F_GETFD);
-	if (fd_flags == -1)
-		return -EBADF;
+    if (name == 0)
+        return EXT2_ET_BAD_DEVICE_NAME;
 
-	flags = 0;
-	if (fd_flags & O_RDWR)
-		flags |= IO_FLAG_RW;
-	if (fd_flags & O_EXCL)
-		flags |= IO_FLAG_EXCLUSIVE;
+    open_flags = (flags & IO_FLAG_RW) ? O_RDWR : O_RDONLY;
+    if (flags & IO_FLAG_EXCLUSIVE)
+        open_flags |= O_EXCL;
 #if defined(O_DIRECT)
-	if (fd_flags & O_DIRECT)
-		flags |= IO_FLAG_DIRECT_IO;
+    if (flags & IO_FLAG_DIRECT_IO)
+        open_flags |= O_DIRECT;
 #endif
-#endif  /* HAVE_FCNTL */
-
-	return unix_open_channel(str_fd, fd, flags, channel, unixfd_io_manager);
-}
-
-static errcode_t qemu_open(const char *name, int flags,
-			   io_channel *channel)
-{
-	int fd = -1;
-	int open_flags;
-
-	if (name == 0)
-		return EXT2_ET_BAD_DEVICE_NAME;
-
-	open_flags = (flags & IO_FLAG_RW) ? O_RDWR : O_RDONLY;
-	if (flags & IO_FLAG_EXCLUSIVE)
-		open_flags |= O_EXCL;
-#if defined(O_DIRECT)
-	if (flags & IO_FLAG_DIRECT_IO)
-		open_flags |= O_DIRECT;
-#endif
-	fd = qcow2fs_open_file(name, open_flags, 0);
-	if (fd < 0)
-		return errno;
+    errno = qcow2fs_open_file(name, open_flags, 0);
+    if (errno < 0)
+        return errno;
 #if defined(F_NOCACHE) && !defined(IO_DIRECT)
-	if (flags & IO_FLAG_DIRECT_IO) {
-		if (fcntl(fd, F_NOCACHE, 1) < 0)
-			return errno;
-	}
+    if (flags & IO_FLAG_DIRECT_IO) {
+        if (fcntl(fd, F_NOCACHE, 1) < 0)
+            return errno;
+    }
 #endif
-	return unix_open_channel(name, fd, flags, channel, qemu_io_manager);
+    return unix_open_channel(name, qemuio_blk, flags, channel, qemu_io_manager);
 }
 
-static errcode_t qemu_close(io_channel channel)
+static errcode_t qemu_close1(io_channel channel)
 {
-	struct unix_private_data *data;
-	errcode_t	retval = 0;
+    struct unix_private_data *data;
+    errcode_t    retval = 0;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (--channel->refcount > 0)
-		return 0;
+    if (--channel->refcount > 0)
+        return 0;
 
 #ifndef NO_IO_CACHE
-	retval = flush_cached_blocks(channel, data, 0);
+    retval = flush_cached_blocks(channel, data, 0);
 #endif
 
-	if (close(data->dev) < 0)
-		retval = errno;
-	free_cache(data);
+    blk_unref(qemuio_blk);
+    qemuio_blk = NULL;
+    free_cache(data);
 
-	ext2fs_free_mem(&channel->private_data);
-	if (channel->name)
-		ext2fs_free_mem(&channel->name);
-	ext2fs_free_mem(&channel);
-	return retval;
+    ext2fs_free_mem(&channel->private_data);
+    if (channel->name)
+        ext2fs_free_mem(&channel->name);
+    ext2fs_free_mem(&channel);
+    return retval;
 }
 
 static errcode_t qemu_set_blksize(io_channel channel, int blksize)
 {
-	struct unix_private_data *data;
-	errcode_t		retval;
+    struct unix_private_data *data;
+    errcode_t        retval;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (channel->block_size != blksize) {
+    if (channel->block_size != blksize) {
 #ifndef NO_IO_CACHE
-		if ((retval = flush_cached_blocks(channel, data, 0)))
-			return retval;
+        if ((retval = flush_cached_blocks(channel, data, 0)))
+            return retval;
 #endif
 
-		channel->block_size = blksize;
-		free_cache(data);
-		if ((retval = alloc_cache(channel, data)))
-			return retval;
-	}
-	return 0;
+        channel->block_size = blksize;
+        free_cache(data);
+        if ((retval = alloc_cache(channel, data)))
+            return retval;
+    }
+    return 0;
 }
 
 static errcode_t qemu_read_blk64(io_channel channel, unsigned long long block,
-			       int count, void *buf)
+                   int count, void *buf)
 {
-	struct unix_private_data *data;
-	struct unix_cache *cache, *reuse[READ_DIRECT_SIZE];
-	errcode_t	retval;
-	char		*cp;
-	int		i, j;
+    struct unix_private_data *data;
+    struct unix_cache *cache, *reuse[READ_DIRECT_SIZE];
+    errcode_t    retval;
+    char        *cp;
+    int        i, j;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
 #ifdef NO_IO_CACHE
-	return raw_read_blk(channel, data, block, count, buf);
+    return raw_read_blk(channel, data, block, count, buf);
 #else
-	/*
-	 * If we're doing an odd-sized read or a very large read,
-	 * flush out the cache and then do a direct read.
-	 */
-	if (count < 0 || count > WRITE_DIRECT_SIZE) {
-		if ((retval = flush_cached_blocks(channel, data, 0)))
-			return retval;
-		return raw_read_blk(channel, data, block, count, buf);
-	}
+    /*
+     * If we're doing an odd-sized read or a very large read,
+     * flush out the cache and then do a direct read.
+     */
+    if (count < 0 || count > WRITE_DIRECT_SIZE) {
+        if ((retval = flush_cached_blocks(channel, data, 0)))
+            return retval;
+        return raw_read_blk(channel, data, block, count, buf);
+    }
 
-	cp = buf;
-	while (count > 0) {
-		/* If it's in the cache, use it! */
-		if ((cache = find_cached_block(data, block, &reuse[0]))) {
+    cp = buf;
+    while (count > 0) {
+        /* If it's in the cache, use it! */
+        if ((cache = find_cached_block(data, block, &reuse[0]))) {
 #ifdef DEBUG
-			printf("Using cached block %lu\n", block);
+            printf("Using cached block %lu\n", block);
 #endif
-			memcpy(cp, cache->buf, channel->block_size);
-			count--;
-			block++;
-			cp += channel->block_size;
-			continue;
-		}
-		if (count == 1) {
-			/*
-			 * Special case where we read directly into the
-			 * cache buffer; important in the O_DIRECT case
-			 */
-			cache = reuse[0];
-			reuse_cache(channel, data, cache, block);
-			if ((retval = raw_read_blk(channel, data, block, 1,
-						   cache->buf))) {
-				cache->in_use = 0;
-				return retval;
-			}
-			memcpy(cp, cache->buf, channel->block_size);
-			return 0;
-		}
+            memcpy(cp, cache->buf, channel->block_size);
+            count--;
+            block++;
+            cp += channel->block_size;
+            continue;
+        }
+        if (count == 1) {
+            /*
+             * Special case where we read directly into the
+             * cache buffer; important in the O_DIRECT case
+             */
+            cache = reuse[0];
+            reuse_cache(channel, data, cache, block);
+            if ((retval = raw_read_blk(channel, data, block, 1,
+                           cache->buf))) {
+                cache->in_use = 0;
+                return retval;
+            }
+            memcpy(cp, cache->buf, channel->block_size);
+            return 0;
+        }
 
-		/*
-		 * Find the number of uncached blocks so we can do a
-		 * single read request
-		 */
-		for (i=1; i < count; i++)
-			if (find_cached_block(data, block+i, &reuse[i]))
-				break;
+        /*
+         * Find the number of uncached blocks so we can do a
+         * single read request
+         */
+        for (i=1; i < count; i++)
+            if (find_cached_block(data, block+i, &reuse[i]))
+                break;
 #ifdef DEBUG
-		printf("Reading %d blocks starting at %lu\n", i, block);
+        printf("Reading %d blocks starting at %lu\n", i, block);
 #endif
-		if ((retval = raw_read_blk(channel, data, block, i, cp)))
-			return retval;
+        if ((retval = raw_read_blk(channel, data, block, i, cp)))
+            return retval;
 
-		/* Save the results in the cache */
-		for (j=0; j < i; j++) {
-			count--;
-			cache = reuse[j];
-			reuse_cache(channel, data, cache, block++);
-			memcpy(cache->buf, cp, channel->block_size);
-			cp += channel->block_size;
-		}
-	}
-	return 0;
+        /* Save the results in the cache */
+        for (j=0; j < i; j++) {
+            count--;
+            cache = reuse[j];
+            reuse_cache(channel, data, cache, block++);
+            memcpy(cache->buf, cp, channel->block_size);
+            cp += channel->block_size;
+        }
+    }
+    return 0;
 #endif /* NO_IO_CACHE */
 }
 
 static errcode_t qemu_read_blk(io_channel channel, unsigned long block,
-			       int count, void *buf)
+                   int count, void *buf)
 {
-	return qemu_read_blk64(channel, block, count, buf);
+    return qemu_read_blk64(channel, block, count, buf);
 }
 
 static errcode_t qemu_write_blk64(io_channel channel, unsigned long long block,
-				int count, const void *buf)
+                int count, const void *buf)
 {
-	struct unix_private_data *data;
-	struct unix_cache *cache, *reuse;
-	errcode_t	retval = 0;
-	const char	*cp;
-	int		writethrough;
+    struct unix_private_data *data;
+    struct unix_cache *cache, *reuse;
+    errcode_t    retval = 0;
+    const char    *cp;
+    int        writethrough;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
 #ifdef NO_IO_CACHE
-	return raw_write_blk(channel, data, block, count, buf);
+    return raw_write_blk(channel, data, block, count, buf);
 #else
-	/*
-	 * If we're doing an odd-sized write or a very large write,
-	 * flush out the cache completely and then do a direct write.
-	 */
-	if (count < 0 || count > WRITE_DIRECT_SIZE) {
-		if ((retval = flush_cached_blocks(channel, data, 1)))
-			return retval;
-		return raw_write_blk(channel, data, block, count, buf);
-	}
+    /*
+     * If we're doing an odd-sized write or a very large write,
+     * flush out the cache completely and then do a direct write.
+     */
+    if (count < 0 || count > WRITE_DIRECT_SIZE) {
+        if ((retval = flush_cached_blocks(channel, data, 1)))
+            return retval;
+        return raw_write_blk(channel, data, block, count, buf);
+    }
 
-	/*
-	 * For a moderate-sized multi-block write, first force a write
-	 * if we're in write-through cache mode, and then fill the
-	 * cache with the blocks.
-	 */
-	writethrough = channel->flags & CHANNEL_FLAGS_WRITETHROUGH;
-	if (writethrough)
-		retval = raw_write_blk(channel, data, block, count, buf);
+    /*
+     * For a moderate-sized multi-block write, first force a write
+     * if we're in write-through cache mode, and then fill the
+     * cache with the blocks.
+     */
+    writethrough = channel->flags & CHANNEL_FLAGS_WRITETHROUGH;
+    if (writethrough)
+        retval = raw_write_blk(channel, data, block, count, buf);
 
-	cp = buf;
-	while (count > 0) {
-		cache = find_cached_block(data, block, &reuse);
-		if (!cache) {
-			cache = reuse;
-			reuse_cache(channel, data, cache, block);
-		}
-		if (cache->buf != cp)
-			memcpy(cache->buf, cp, channel->block_size);
-		cache->dirty = !writethrough;
-		count--;
-		block++;
-		cp += channel->block_size;
-	}
-	return retval;
+    cp = buf;
+    while (count > 0) {
+        cache = find_cached_block(data, block, &reuse);
+        if (!cache) {
+            cache = reuse;
+            reuse_cache(channel, data, cache, block);
+        }
+        if (cache->buf != cp)
+            memcpy(cache->buf, cp, channel->block_size);
+        cache->dirty = !writethrough;
+        count--;
+        block++;
+        cp += channel->block_size;
+    }
+    return retval;
 #endif /* NO_IO_CACHE */
 }
 
 static errcode_t qemu_cache_readahead(io_channel channel,
-				      unsigned long long block,
-				      unsigned long long count)
+                      unsigned long long block,
+                      unsigned long long count)
 {
-#ifdef POSIX_FADV_WILLNEED
-	struct unix_private_data *data;
-
-	data = (struct unix_private_data *)channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
-	return posix_fadvise(data->dev,
-			     (ext2_loff_t)block * channel->block_size + data->offset,
-			     (ext2_loff_t)count * channel->block_size,
-			     POSIX_FADV_WILLNEED);
-#else
-	return EXT2_ET_OP_NOT_SUPPORTED;
-#endif
+    return EXT2_ET_OP_NOT_SUPPORTED;
 }
 
 static errcode_t qemu_write_blk(io_channel channel, unsigned long block,
-				int count, const void *buf)
+                int count, const void *buf)
 {
-	return qemu_write_blk64(channel, block, count, buf);
+    return qemu_write_blk64(channel, block, count, buf);
 }
 
 static errcode_t qemu_write_byte(io_channel channel, unsigned long offset,
-				 int size, const void *buf)
+                 int size, const void *buf)
 {
-	struct unix_private_data *data;
-	errcode_t	retval = 0;
-	ssize_t		actual;
+    struct unix_private_data *data;
+    errcode_t    retval = 0;
+    ssize_t        actual;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (channel->align != 0) {
+    if (channel->align != 0) {
 #ifdef ALIGN_DEBUG
-		printf("qemu_write_byte: O_DIRECT fallback\n");
+        printf("qemu_write_byte: O_DIRECT fallback\n");
 #endif
-		return EXT2_ET_UNIMPLEMENTED;
-	}
+        return EXT2_ET_UNIMPLEMENTED;
+    }
 
 #ifndef NO_IO_CACHE
-	/*
-	 * Flush out the cache completely
-	 */
-	if ((retval = flush_cached_blocks(channel, data, 1)))
-		return retval;
+    /*
+     * Flush out the cache completely
+     */
+    if ((retval = flush_cached_blocks(channel, data, 1)))
+        return retval;
 #endif
 
-	if (lseek(data->dev, offset + data->offset, SEEK_SET) < 0)
-		return errno;
+    if (actual != size)
+        return EXT2_ET_SHORT_WRITE;
 
-	actual = write(data->dev, buf, size);
-	if (actual < 0)
-		return errno;
-	if (actual != size)
-		return EXT2_ET_SHORT_WRITE;
-
-	return 0;
+    return 0;
 }
 
 /*
@@ -1035,96 +860,60 @@ static errcode_t qemu_write_byte(io_channel channel, unsigned long offset,
  */
 static errcode_t qemu_flush(io_channel channel)
 {
-	struct unix_private_data *data;
-	errcode_t retval = 0;
+    struct unix_private_data *data;
+    errcode_t retval = 0;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-#ifndef NO_IO_CACHE
-	retval = flush_cached_blocks(channel, data, 0);
-#endif
-#ifdef HAVE_FSYNC
-	if (!retval && fsync(data->dev) != 0)
-		return errno;
-#endif
-	return retval;
+    return retval;
 }
 
 static errcode_t qemu_set_option(io_channel channel, const char *option,
-				 const char *arg)
+                 const char *arg)
 {
-	struct unix_private_data *data;
-	unsigned long long tmp;
-	char *end;
+    struct unix_private_data *data;
+    unsigned long long tmp;
+    char *end;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (!strcmp(option, "offset")) {
-		if (!arg)
-			return EXT2_ET_INVALID_ARGUMENT;
+    if (!strcmp(option, "offset")) {
+        if (!arg)
+            return EXT2_ET_INVALID_ARGUMENT;
 
-		tmp = strtoull(arg, &end, 0);
-		if (*end)
-			return EXT2_ET_INVALID_ARGUMENT;
-		data->offset = tmp;
-		if (data->offset < 0)
-			return EXT2_ET_INVALID_ARGUMENT;
-		return 0;
-	}
-	return EXT2_ET_INVALID_ARGUMENT;
+        tmp = strtoull(arg, &end, 0);
+        if (*end)
+            return EXT2_ET_INVALID_ARGUMENT;
+        data->offset = tmp;
+        if (data->offset < 0)
+            return EXT2_ET_INVALID_ARGUMENT;
+        return 0;
+    }
+    return EXT2_ET_INVALID_ARGUMENT;
 }
 
 #if defined(__linux__) && !defined(BLKDISCARD)
-#define BLKDISCARD		_IO(0x12,119)
+#define BLKDISCARD        _IO(0x12,119)
 #endif
 
 static errcode_t qemu_discard(io_channel channel, unsigned long long block,
-			      unsigned long long count)
+                  unsigned long long count)
 {
-	struct unix_private_data *data;
-	int		ret;
+    struct unix_private_data *data;
+    int        ret;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (channel->flags & CHANNEL_FLAGS_BLOCK_DEVICE) {
-#ifdef BLKDISCARD
-		__u64 range[2];
-
-		range[0] = (__u64)(block) * channel->block_size + data->offset;
-		range[1] = (__u64)(count) * channel->block_size;
-
-		ret = ioctl(data->dev, BLKDISCARD, &range);
-#else
-		goto unimplemented;
-#endif
-	} else {
-#if defined(HAVE_FALLOCATE) && defined(FALLOC_FL_PUNCH_HOLE)
-		/*
-		 * If we are not on block device, try to use punch hole
-		 * to reclaim free space.
-		 */
-		ret = fallocate(data->dev,
-				FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-				(off_t)(block) * channel->block_size + data->offset,
-				(off_t)(count) * channel->block_size);
-#else
-		goto unimplemented;
-#endif
-	}
-	if (ret < 0) {
-		if (errno == EOPNOTSUPP)
-			goto unimplemented;
-		return errno;
-	}
-	return 0;
-unimplemented:
-	return EXT2_ET_UNIMPLEMENTED;
+    if (ret < 0) {
+        return ret;
+    }
+    return 0;
 }
 
 /*
@@ -1133,23 +922,11 @@ unimplemented:
  * it always invalidates page cache, and libext2fs requires that reads after
  * ZERO_RANGE return zeroes.
  */
-static int __qemu_zeroout(int fd, off_t offset, off_t len)
+static int __qemu_zeroout(BlockBackend *blk, off_t offset, off_t len)
 {
-	int ret = -1;
+    int ret = -1;
 
-#if defined(HAVE_FALLOCATE) && defined(FALLOC_FL_ZERO_RANGE)
-	ret = fallocate(fd, FALLOC_FL_ZERO_RANGE, offset, len);
-	if (ret == 0)
-		return 0;
-#endif
-#if defined(HAVE_FALLOCATE) && defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
-	ret = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-			offset,  len);
-	if (ret == 0)
-		return 0;
-#endif
-	errno = EOPNOTSUPP;
-	return ret;
+    return ret;
 }
 
 /* parameters might not be used if OS doesn't support zeroout */
@@ -1158,74 +935,51 @@ static int __qemu_zeroout(int fd, off_t offset, off_t len)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 static errcode_t qemu_zeroout(io_channel channel, unsigned long long block,
-			      unsigned long long count)
+                              unsigned long long count)
 {
-	struct unix_private_data *data;
-	int		ret;
+    struct unix_private_data *data;
+    int        ret;
 
-	EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
-	data = (struct unix_private_data *) channel->private_data;
-	EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
+    EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
+    data = (struct unix_private_data *) channel->private_data;
+    EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-	if (safe_getenv("UNIX_IO_NOZEROOUT"))
-		goto unimplemented;
+    if (safe_getenv("UNIX_IO_NOZEROOUT"))
+        goto unimplemented;
 
-	if (!(channel->flags & CHANNEL_FLAGS_BLOCK_DEVICE)) {
-		/* Regular file, try to use truncate/punch/zero. */
-		struct stat statbuf;
-
-		if (count == 0)
-			return 0;
-		/*
-		 * If we're trying to zero a range past the end of the file,
-		 * extend the file size, then truncate everything.
-		 */
-		ret = fstat(data->dev, &statbuf);
-		if (ret)
-			goto err;
-		if ((unsigned long long) statbuf.st_size <
-			(block + count) * channel->block_size + data->offset) {
-			ret = ftruncate(data->dev,
-					(block + count) * channel->block_size + data->offset);
-			if (ret)
-				goto err;
-		}
-	}
-
-	ret = __qemu_zeroout(data->dev,
-			(off_t)(block) * channel->block_size + data->offset,
-			(off_t)(count) * channel->block_size);
-err:
-	if (ret < 0) {
-		if (errno == EOPNOTSUPP)
-			goto unimplemented;
-		return errno;
-	}
-	return 0;
+    ret = __qemu_zeroout(data->blk,
+            (off_t)(block) * channel->block_size + data->offset,
+            (off_t)(count) * channel->block_size);
+    if (ret < 0) {
+        if (errno == EOPNOTSUPP)
+            goto unimplemented;
+        return errno;
+    }
+    return 0;
 unimplemented:
-	return EXT2_ET_UNIMPLEMENTED;
+    return EXT2_ET_UNIMPLEMENTED;
 }
 #if __GNUC_PREREQ (4, 6)
 #pragma GCC diagnostic pop
 #endif
 
 static struct struct_io_manager struct_qemu_manager = {
-	.magic		= EXT2_ET_MAGIC_IO_MANAGER,
-	.name		= "QEMU I/O Manager",
-	.open		= qemu_open,
-	.close		= qemu_close,
-	.set_blksize	= qemu_set_blksize,
-	.read_blk	= qemu_read_blk,
-	.write_blk	= qemu_write_blk,
-	.flush		= qemu_flush,
-	.write_byte	= qemu_write_byte,
-	.set_option	= qemu_set_option,
-	.get_stats	= qemu_get_stats,
-	.read_blk64	= qemu_read_blk64,
-	.write_blk64	= qemu_write_blk64,
-	.discard	= qemu_discard,
-	.cache_readahead	= qemu_cache_readahead,
-	.zeroout	= qemu_zeroout,
+    .magic        = EXT2_ET_MAGIC_IO_MANAGER,
+    .name        = "QEMU I/O Manager",
+    .open        = qemu_open1,
+    .close        = qemu_close1,
+    .set_blksize    = qemu_set_blksize,
+    .read_blk    = qemu_read_blk,
+    .write_blk    = qemu_write_blk,
+    .flush        = qemu_flush,
+    .write_byte    = qemu_write_byte,
+    .set_option    = qemu_set_option,
+    .get_stats    = qemu_get_stats,
+    .read_blk64    = qemu_read_blk64,
+    .write_blk64    = qemu_write_blk64,
+    .discard    = qemu_discard,
+    .cache_readahead    = qemu_cache_readahead,
+    .zeroout    = qemu_zeroout,
 };
 
 io_manager qemu_io_manager = &struct_qemu_manager;
