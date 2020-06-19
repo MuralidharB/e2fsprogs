@@ -221,26 +221,27 @@ static errcode_t raw_read_blk(io_channel channel,
     errcode_t     retval;
     ext2_loff_t    location;
     ssize_t       size;
-    unsigned char *buf = bufv;
+    unsigned char *buf;
     int64_t       total;
 
     size = (count < 0) ? -count : (ext2_loff_t) count * channel->block_size;
     data->io_stats.bytes_read += size;
     location = ((ext2_loff_t) block * channel->block_size) + data->offset;
 
-    buf = qemu_io_alloc(data->blk, count, 0xab);
+    buf = qemu_io_alloc(data->blk, size, 0xab);
 
-    retval = do_pread(data->blk, buf, location, count, &total);
+    retval = do_pread(data->blk, buf, location, size, &total);
 
     if (retval < 0) {
         printf("read failed: %s\n", strerror(-retval));
         goto out;
     }
 
+    memcpy(bufv, buf, size);
+
 out:
     qemu_io_free(buf);
 
-    return 0;
     return retval;
 }
 
@@ -414,29 +415,20 @@ static errcode_t flush_cached_blocks(io_channel channel,
 int qcow2fs_open_file(const char *pathname, int flags, mode_t mode)
 {
     Error *local_err = NULL;
-    QDict *opts;
+    QDict *opts = NULL;
 
     if (qemuio_blk) {
         return 1;
     }
 
-    opts = qdict_new();
-    if (qdict_haskey(opts, BDRV_OPT_FORCE_SHARE)
-        && !qdict_get_bool(opts, BDRV_OPT_FORCE_SHARE)) {
-        QDECREF(opts);
-        return 1;
-    }
-    qdict_put_bool(opts, BDRV_OPT_FORCE_SHARE, true);
-
+    flags = 16386;
     qemuio_blk = blk_new_open(pathname, NULL, opts, flags, &local_err);
     if (!qemuio_blk) {
-        QDECREF(opts);
         return 1;
     }
 
     blk_set_enable_write_cache(qemuio_blk, true);
 
-    QDECREF(opts);
     return 0;
 }
 
@@ -595,8 +587,8 @@ cleanup:
 static errcode_t qemu_open1(const char *name, int flags,
                io_channel *channel)
 {
+    int retval;
     int open_flags;
-    int errno;
 
     if (name == 0)
         return EXT2_ET_BAD_DEVICE_NAME;
@@ -604,19 +596,11 @@ static errcode_t qemu_open1(const char *name, int flags,
     open_flags = (flags & IO_FLAG_RW) ? O_RDWR : O_RDONLY;
     if (flags & IO_FLAG_EXCLUSIVE)
         open_flags |= O_EXCL;
-#if defined(O_DIRECT)
-    if (flags & IO_FLAG_DIRECT_IO)
-        open_flags |= O_DIRECT;
-#endif
-    errno = qcow2fs_open_file(name, open_flags, 0);
-    if (errno < 0)
-        return errno;
-#if defined(F_NOCACHE) && !defined(IO_DIRECT)
-    if (flags & IO_FLAG_DIRECT_IO) {
-        if (fcntl(fd, F_NOCACHE, 1) < 0)
-            return errno;
-    }
-#endif
+
+    retval = qcow2fs_open_file(name, open_flags, 0);
+    if (retval < 0)
+        return retval;
+
     return unix_open_channel(name, qemuio_blk, flags, channel, qemu_io_manager);
 }
 
@@ -828,7 +812,6 @@ static errcode_t qemu_write_byte(io_channel channel, unsigned long offset,
 {
     struct unix_private_data *data;
     errcode_t    retval = 0;
-    ssize_t        actual;
 
     EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
     data = (struct unix_private_data *) channel->private_data;
@@ -848,9 +831,6 @@ static errcode_t qemu_write_byte(io_channel channel, unsigned long offset,
     if ((retval = flush_cached_blocks(channel, data, 1)))
         return retval;
 #endif
-
-    if (actual != size)
-        return EXT2_ET_SHORT_WRITE;
 
     return 0;
 }
@@ -904,15 +884,11 @@ static errcode_t qemu_discard(io_channel channel, unsigned long long block,
                   unsigned long long count)
 {
     struct unix_private_data *data;
-    int        ret;
 
     EXT2_CHECK_MAGIC(channel, EXT2_ET_MAGIC_IO_CHANNEL);
     data = (struct unix_private_data *) channel->private_data;
     EXT2_CHECK_MAGIC(data, EXT2_ET_MAGIC_UNIX_IO_CHANNEL);
 
-    if (ret < 0) {
-        return ret;
-    }
     return 0;
 }
 
