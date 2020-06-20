@@ -2663,6 +2663,7 @@ int main(int argc, char **argv)
              exit(1);
          }
     if (optind < argc)
+        open_flags = 16386;
         open_filesystem(argv[optind], open_flags,
                 superblock, blocksize, catastrophic,
                 data_filename, undo_file);

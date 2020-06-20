@@ -194,7 +194,7 @@ static int do_pread(BlockBackend *blk, const unsigned char *buf, int64_t offset,
     if (*total < 0) {
         return *total;
     }
-    return 1;
+    return 0;
 }
 
 static int do_pwrite(BlockBackend *blk, const unsigned char *buf, int64_t offset,
@@ -208,7 +208,7 @@ static int do_pwrite(BlockBackend *blk, const unsigned char *buf, int64_t offset
     if (*total < 0) {
         return *total;
     }
-    return 1;
+    return 0;
 }
 /*
  * Here are the raw I/O functions
@@ -418,13 +418,13 @@ int qcow2fs_open_file(const char *pathname, int flags, mode_t mode)
     QDict *opts = NULL;
 
     if (qemuio_blk) {
-        return 1;
+        return -11;
     }
 
     flags = 16386;
     qemuio_blk = blk_new_open(pathname, NULL, opts, flags, &local_err);
     if (!qemuio_blk) {
-        return 1;
+        return -1;
     }
 
     blk_set_enable_write_cache(qemuio_blk, true);
