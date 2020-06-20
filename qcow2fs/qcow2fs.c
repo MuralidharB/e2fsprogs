@@ -2572,9 +2572,9 @@ int main(int argc, char **argv)
 
     if (debug_prog_name == 0)
 #ifdef READ_ONLY
-        debug_prog_name = "rdebugfs";
+        debug_prog_name = "rqcow2fs";
 #else
-        debug_prog_name = "debugfs";
+        debug_prog_name = "qcow2fs";
 #endif
     add_error_table(&et_ext2_error_table);
     fprintf (stderr, "%s %s (%s)\n", debug_prog_name,
