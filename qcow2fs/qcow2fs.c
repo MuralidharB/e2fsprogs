@@ -2604,6 +2604,11 @@ int main(int argc, char **argv)
     qemu_add_opts(&qemu_object_opts);
     qemu_add_opts(&qemu_trace_opts);
     bdrv_init();
+    if (qemu_init_main_loop(&local_error)) {
+        error_report_err(local_error);
+        ss_perror(ss_sci_idx, -1, "calling qemu_init_main_loop");
+        exit(1);
+    }
 
     while ((c = getopt (argc, argv, opt_string)) != EOF) {
         switch (c) {
@@ -2657,16 +2662,12 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-        if (qemu_init_main_loop(&local_error)) {
-             error_report_err(local_error);
-             ss_perror(ss_sci_idx, -1, "calling qemu_init_main_loop");
-             exit(1);
-         }
-    if (optind < argc)
+    if (optind < argc) {
         open_flags = 16386;
         open_filesystem(argv[optind], open_flags,
                 superblock, blocksize, catastrophic,
                 data_filename, undo_file);
+    }
 
     ss_sci_idx = ss_create_invocation(debug_prog_name, "0.0", (char *) NULL,
                       &debug_cmds, &retval);
