@@ -1,10 +1,20 @@
 import argparse
+from contextlib import ContextDecorator
 from datetime import datetime
 import os
 import shutil
-import subprocess
 import sys
+import subprocess
+from subprocess import Popen, PIPE
+import threading
+from time import sleep
 import traceback
+
+try:
+    from queue import Queue, Empty
+except ImportError:
+    from Queue import Queue, Empty  # python 2.x
+
 
 def execute(args):
     try:
@@ -30,97 +40,131 @@ def execute(args):
         raise
 
 
-def run_qcow2fs_command(command, qcow2path):
-    args = "./qcow2fs -R".split()
-    args.append(command)
-    args.append(qcow2path)
+prog = "../build/qcow2fs/qcow2fs"
 
-    return execute(args)
+class Qcow2FSSession(ContextDecorator):
+    def __init__(self, qcow2file):
+        self.qcow2file = qcow2file
 
+    def __enter__(self):
+        env = os.environ.copy()
+        cmd = "%s %s" % (prog, self.qcow2file)
+        self.process = Popen(cmd.split(), stdin=PIPE, stdout=PIPE,
+                             stderr=subprocess.STDOUT, shell=False, env=env)
 
-def get_blocks(pathname, qcow2path):
-    blocks_str = run_qcow2fs_command("blocks %s" %pathname, qcow2path)
+        self.queue = Queue()
+        def writeall(p, q):
+            for line in iter(p.stdout.readline, b''):
+                q.put(line.decode())
+            p.stdout.close()
 
-    return blocks_str.split()
-    pass
+        writer = threading.Thread(target=writeall, args=(self.process, self.queue))
+        writer.start()
 
+        command_output = ""
+        try:
+            while True:
+                line = self.queue.get(timeout=.2) # or q.get(timeout=.1)
+                command_output += line
+        except:
+            pass
+        return self
 
-def zap_blocks(blocks, qcow2path):
-    for b in blocks:
-        run_qcow2fs_command("zap %s" % (str(b)), qcow2path)
-
-
-def backup_file(src, dest, qcow2path):
-    pass
-
-
-def delete_file(pathname, qcow2path):
-    return run_qcow2fs_command("rm %s" % (str(pathname)), qcow2path)
-
-
-def mkdir(pathname, qcow2path):
-    return run_qcow2fs_command("mkdir %s" % (str(pathname)), qcow2path)
-
-
-def stat_file(pathname, qcow2path):
-    stat_str = run_qcow2fs_command("stat %s" % (str(pathname)), qcow2path)
-    stat = {}
-
-    for s in stat_str.split("\n"):
-        if "ctime" in s:
-             stat['st_ctime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
-        elif "atime" in s:
-             stat['st_atime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
-        elif "mtime" in s:
-             stat['st_mtime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
-        elif "crtime" in s:
-             stat['st_crtime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
-
-    stat['type'] = stat_str.split("\n")[0].split('Type:')[1].split('Mode:')[0].strip()
-    stat['mode'] = stat_str.split("\n")[0].split('Mode:')[1].split('Flags:')[0].strip()
-
-    stat['user'] = int(stat_str.split("\n")[2].split('User:')[1].split('Group:')[0].strip())
-    stat['group'] = int(stat_str.split("\n")[2].split('Group:')[1].split('Size:')[0].strip())
-    stat['size'] = int(stat_str.split("\n")[2].split('Size:')[1].strip())
-    return stat
-
-
-def exists(pathname, qcow2path):
-    try:
-        stat_file(pathname, qcow2path)
-        return True
-    except:
+    def __exit__(self, *exc):
         return False
 
+    def send_cmd(self, message):
+        try:
+            message += '\n\r'
+            self.process.stdin.write(message.encode())
+            self.process.stdin.flush()
 
-def makedirs(pathname, qcow2path):
+            sleep(1)
+            command_output = ""
+            try:
+                while True:
+                    line = self.queue.get(timeout=.2) # or q.get(timeout=.1)
+                    if not 'qcow2fs:' in line:
+                        command_output += line
+            except Empty:
+                return command_output
+        except BrokenPipeError:
+            return None
+
+    def get_blocks(self, pathname):
+        blocks_str = self.send_cmd("blocks %s" %pathname)
+
+        return blocks_str.split()
+
+    def zap_blocks(self, blocks):
+        for b in blocks:
+            self.send_cmd("zap %s" % (str(b)))
+
+    def backup_file(self, src, dest):
+        pass
+
+    def delete_file(self, pathname):
+        return self.send_cmd("rm %s" % (str(pathname)))
+
+    def mkdir(self, pathname):
+        return self.send_cmd("mkdir %s" % (str(pathname)))
+
+    def stat_file(self, pathname):
+        stat_str = self.send_cmd("stat %s" % (str(pathname)))
+        stat = {}
+
+        for s in stat_str.split("\n"):
+            if "ctime" in s:
+                 stat['st_ctime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
+            elif "atime" in s:
+                 stat['st_atime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
+            elif "mtime" in s:
+                 stat['st_mtime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
+            elif "crtime" in s:
+                 stat['st_crtime'] = datetime.strptime(s.split('--')[1].strip(), "%c")
+
+        stat['type'] = stat_str.split("\n")[0].split('Type:')[1].split('Mode:')[0].strip()
+        stat['mode'] = stat_str.split("\n")[0].split('Mode:')[1].split('Flags:')[0].strip()
+
+        stat['user'] = int(stat_str.split("\n")[2].split('User:')[1].split('Group:')[0].strip())
+        stat['group'] = int(stat_str.split("\n")[2].split('Group:')[1].split('Size:')[0].strip())
+        stat['size'] = int(stat_str.split("\n")[2].split('Size:')[1].strip())
+        return stat
+
+    def exists(self, pathname):
+        try:
+            self.stat_file(pathname)
+            return True
+        except:
+            return False
+
+    def makedirs(self, pathname):
   
-    d, f = os.path.split(pathname)
-    if d != '/':
-         makedirs(d, qcow2path)
+        d, f = os.path.split(pathname)
+        if d != '/':
+             self.makedirs(d)
     
-    if not exists(pathname, qcow2path):
-        mkdir(pathname, qcow2path)
+        if not self.exists(pathname):
+            self.mkdir(self, pathname)
 
+    def walk(self, pathname):
+        ls_str = self.send_cmd("ls -l %s" % (str(pathname)))
 
-def walk(pathname, qcow2path):
-    ls_str = run_qcow2fs_command("ls -l %s" % (str(pathname)), qcow2path)
+        dirs = []
+        files = []
+        for l in ls_str.split("\n"):
+            if not l:
+                continue
+            if l.split()[8] in [".", ".."]:
+                continue
+            if l.split()[1].startswith("40"):
+                dirs.append(l.split()[8])
+            else:
+                files.append(l.split()[8])
+        yield pathname, dirs, files
 
-    dirs = []
-    files = []
-    for l in ls_str.split("\n"):
-        if not l:
-            continue
-        if l.split()[8] in [".", ".."]:
-             continue
-        if l.split()[1].startswith("40"):
-             dirs.append(l.split()[8])
-        else:
-             files.append(l.split()[8])
-    yield pathname, dirs, files
-
-    for d in dirs:
-        walk(os.path.join(pathname, d), qcow2path)
+        for d in dirs:
+           self.walk(os.path.join(pathname, d))
 
 
 def full_backup(pv_mnt, qcow2path):
@@ -138,64 +182,65 @@ def full_backup(pv_mnt, qcow2path):
 
 def incr_backup(pv_mnt, qcow2path):
     # copy modified or new files from prod pv to backup
-    for path, dirs, files in os.walk(pv_mnt):
-        for f in files:
-            try:
-                src = os.path.join(path, f)
-                dst = os.path.join(path, f)
-                dst = dst.replace(pv_mnt, "/")
-                pv_st = os.stat(src, follow_symlinks=False)
+    with Qcow2FSSession(qcow2path) as session:
+        for path, dirs, files in os.walk(pv_mnt):
+            for f in files:
+                try:
+                    src = os.path.join(path, f)
+                    dst = os.path.join(path, f)
+                    dst = dst.replace(pv_mnt, "/")
+                    pv_st = os.stat(src, follow_symlinks=False)
 
-                if not exists(os.path.split(dst)[0], qcow2path):
-                    # make sure we have the directory path for new src
-                    makedirs(os.path.split(dst)[0], qcow2path)
+                    if not session.exists(os.path.split(dst)[0]):
+                        # make sure we have the directory path for new src
+                        session.makedirs(os.path.split(dst)[0])
 
-                if os.path.exists(dst):
-                    qcow2_st = stat_file(dst, qcow2path)
-                    if pv_st.st_mtime != qcow2_st['st_mtime']:
-                        backup_file(src, dst, qcow2path) 
-                else:
-                    backup_file(src, dst, qcow2path) 
-            except:
-                pass
+                    if os.path.exists(dst):
+                        qcow2_st = session.stat_file(dst)
+                        if pv_st.st_mtime != qcow2_st['st_mtime']:
+                            session.backup_file(src, dst) 
+                    else:
+                        session.backup_file(src, dst) 
+                except Exception as ex:
+                    print(ex)
 
-        # take care of emptry/new directories
-        for d in dirs:
-            try:
-                src = os.path.join(path, d)
-                dst = os.path.join(path, d)
-                dst = dst.replace(pv_mnt, "/")
-                pv_st = os.stat(src, follow_symlinks=False)
-                if not exists(dst, qcow2path):
-                    # make sure we have the directory path for new src
-                    makedirs(dst, qcow2path)
-            except:
-                pass
+            # take care of emptry/new directories
+            for d in dirs:
+                try:
+                    src = os.path.join(path, d)
+                    dst = os.path.join(path, d)
+                    dst = dst.replace(pv_mnt, "/")
+                    pv_st = os.stat(src, follow_symlinks=False)
+                    if not session.exists(dst):
+                        # make sure we have the directory path for new src
+                        session.makedirs(dst)
+                except Exception as ex:
+                    print(ex)
 
-    # remove any files that are deleted since last backup
-    for path, dirs, files in walk("/", qcow2path):
-        for f in files:
-            try:    
-                src = os.path.join(path, f)
-                dst = os.path.join(path, f)
-                dst = dst.replace("/", pv_mnt)
-                if not os.path.exists(dst):
-                    if isfile(src):
-                        delete_file(src)
-            except:
-                pass
+        # remove any files that are deleted since last backup
+        for path, dirs, files in session.walk("/"):
+            for f in files:
+                try:    
+                    src = os.path.join(path, f)
+                    dst = os.path.join(path, f)
+                    dst = dst.replace("/", pv_mnt)
+                    if not os.path.exists(dst):
+                        if session.isfile(src):
+                            session.delete_file(src)
+                except Exception as ex:
+                    print(ex)
 
-        # take care of emptry/removed directories
-        for d in dirs:
-            try:
-                src = os.path.join(path, d)
-                dst = os.path.join(path, d)
-                dst = dst.replace("/", pv_mnt)
-                if not os.path.exists(dst):
-                    # make sure we have the directory path for new src
-                    rmtree(src)
-            except:
-                pass
+            # take care of emptry/removed directories
+            for d in dirs:
+                try:
+                    src = os.path.join(path, d)
+                    dst = os.path.join(path, d)
+                    dst = dst.replace("/", pv_mnt)
+                    if not os.path.exists(dst):
+                        # make sure we have the directory path for new src
+                        session.rmtree(src)
+                except Exception as ex:
+                    print(ex)
 
 
 if __name__ == "__main__":
@@ -232,9 +277,3 @@ if __name__ == "__main__":
         incr_backup(pv_mnt, args.qcow2image)
     elif args.command == "restore":
         restore(pv_mnt, args.qcow2image)
-
-        run_qcow2fs_command("ls", "/home/centos/xxx.qcow2")
-        blocks = get_blocks("Makefile.am", "/home/centos/xxx.qcow2")
-        print(stat_file("Makefile.am", "/home/centos/xxx.qcow2"))
-        zap_blocks(blocks,  "/home/centos/xxx.qcow2")
-        blocks = delete_file("Makefile.am", "/home/centos/xxx.qcow2")
