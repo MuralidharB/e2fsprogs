@@ -7,7 +7,6 @@ import sys
 import subprocess
 from subprocess import Popen, PIPE
 import threading
-from time import sleep
 import traceback
 
 try:
@@ -71,6 +70,7 @@ class Qcow2FSSession(ContextDecorator):
         return self
 
     def __exit__(self, *exc):
+        self.quit()
         return False
 
     def send_cmd(self, message):
@@ -79,7 +79,6 @@ class Qcow2FSSession(ContextDecorator):
             self.process.stdin.write(message.encode())
             self.process.stdin.flush()
 
-            sleep(1)
             command_output = ""
             try:
                 while True:
@@ -90,6 +89,9 @@ class Qcow2FSSession(ContextDecorator):
                 return command_output
         except BrokenPipeError:
             return None
+
+    def quit(self):
+        self.send_cmd("quit")
 
     def get_blocks(self, pathname):
         blocks_str = self.send_cmd("blocks %s" %pathname)
@@ -138,6 +140,13 @@ class Qcow2FSSession(ContextDecorator):
         except:
             return False
 
+    def isfile(self, pathname):
+        try:
+            stat = self.stat_file(pathname)
+            return stat['type'] == 'regular'
+        except:
+            return False
+
     def makedirs(self, pathname):
   
         d, f = os.path.split(pathname)
@@ -155,16 +164,19 @@ class Qcow2FSSession(ContextDecorator):
         for l in ls_str.split("\n"):
             if not l:
                 continue
-            if l.split()[8] in [".", ".."]:
-                continue
-            if l.split()[1].startswith("40"):
-                dirs.append(l.split()[8])
-            else:
-                files.append(l.split()[8])
+            try:
+                if l.split()[8] in [".", ".."]:
+                    continue
+                if l.split()[1].startswith("40"):
+                    dirs.append(l.split()[8])
+                else:
+                    files.append(l.split()[8])
+            except IndexError as ex:
+                print(l, len(l.split()))
         yield pathname, dirs, files
 
         for d in dirs:
-           self.walk(os.path.join(pathname, d))
+           yield from self.walk(os.path.join(pathname, d))
 
 
 def full_backup(pv_mnt, qcow2path):
@@ -184,11 +196,12 @@ def incr_backup(pv_mnt, qcow2path):
     # copy modified or new files from prod pv to backup
     with Qcow2FSSession(qcow2path) as session:
         for path, dirs, files in os.walk(pv_mnt):
+            print(path)
             for f in files:
                 try:
                     src = os.path.join(path, f)
                     dst = os.path.join(path, f)
-                    dst = dst.replace(pv_mnt, "/")
+                    dst = dst.replace(pv_mnt, "/", 1)
                     pv_st = os.stat(src, follow_symlinks=False)
 
                     if not session.exists(os.path.split(dst)[0]):
@@ -199,8 +212,6 @@ def incr_backup(pv_mnt, qcow2path):
                         qcow2_st = session.stat_file(dst)
                         if pv_st.st_mtime != qcow2_st['st_mtime']:
                             session.backup_file(src, dst) 
-                    else:
-                        session.backup_file(src, dst) 
                 except Exception as ex:
                     print(ex)
 
@@ -209,7 +220,7 @@ def incr_backup(pv_mnt, qcow2path):
                 try:
                     src = os.path.join(path, d)
                     dst = os.path.join(path, d)
-                    dst = dst.replace(pv_mnt, "/")
+                    dst = dst.replace(pv_mnt, "/", 1)
                     pv_st = os.stat(src, follow_symlinks=False)
                     if not session.exists(dst):
                         # make sure we have the directory path for new src
@@ -219,11 +230,12 @@ def incr_backup(pv_mnt, qcow2path):
 
         # remove any files that are deleted since last backup
         for path, dirs, files in session.walk("/"):
+            print(path)
             for f in files:
                 try:    
                     src = os.path.join(path, f)
                     dst = os.path.join(path, f)
-                    dst = dst.replace("/", pv_mnt)
+                    dst = dst.replace("/", pv_mnt, 1)
                     if not os.path.exists(dst):
                         if session.isfile(src):
                             session.delete_file(src)
@@ -235,12 +247,26 @@ def incr_backup(pv_mnt, qcow2path):
                 try:
                     src = os.path.join(path, d)
                     dst = os.path.join(path, d)
-                    dst = dst.replace("/", pv_mnt)
+                    dst = dst.replace("/", pv_mnt, 1)
                     if not os.path.exists(dst):
                         # make sure we have the directory path for new src
                         session.rmtree(src)
                 except Exception as ex:
                     print(ex)
+
+
+def restore(pv_mnt, qcow2path):
+    with Qcow2FSSession(qcow2path) as session:
+         session.rdump(pv_mnt)
+
+
+def compare(pv_mnt, qcow2path):
+    with Qcow2FSSession(qcow2path) as session:
+        for path, dirs, files in os.walk(pv_mnt):
+            pass
+
+        for path, dirs, files in session.walk("/"):
+            pass
 
 
 if __name__ == "__main__":
@@ -257,6 +283,10 @@ if __name__ == "__main__":
     incr.add_argument('qcow2image', help='Path to qcow2 image')
 
     restore = subparsers.add_parser('restore', help='restore')
+    restore.add_argument('pv_mnt', help='Folder where the PV is mounted')
+    restore.add_argument('qcow2image', help='Path to qcow2 image')
+
+    restore = subparsers.add_parser('compare', help='restore')
     restore.add_argument('pv_mnt', help='Folder where the PV is mounted')
     restore.add_argument('qcow2image', help='Path to qcow2 image')
 
@@ -277,3 +307,5 @@ if __name__ == "__main__":
         incr_backup(pv_mnt, args.qcow2image)
     elif args.command == "restore":
         restore(pv_mnt, args.qcow2image)
+    elif args.command == "compare":
+        compare(pv_mnt, args.qcow2image)
