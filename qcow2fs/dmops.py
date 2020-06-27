@@ -108,6 +108,16 @@ class Qcow2FSSession(ContextDecorator):
     def delete_file(self, pathname):
         return self.send_cmd("rm %s" % (str(pathname)))
 
+    def rmtree(self, pathname):
+        for path, dirs, files in self.walk(pathname):
+           for f in files:
+               self.delete_file(os.path.join(path, f))
+
+           for d in dirs:
+               self.rmtree(os.path.join(path, d)
+
+        return self.send_cmd("rmdir %s" % (str(pathname)))
+
     def mkdir(self, pathname):
         return self.send_cmd("mkdir %s" % (str(pathname)))
 
