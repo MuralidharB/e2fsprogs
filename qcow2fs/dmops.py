@@ -114,7 +114,7 @@ class Qcow2FSSession(ContextDecorator):
                self.delete_file(os.path.join(path, f))
 
            for d in dirs:
-               self.rmtree(os.path.join(path, d)
+               self.rmtree(os.path.join(path, d))
 
         return self.send_cmd("rmdir %s" % (str(pathname)))
 
@@ -187,6 +187,9 @@ class Qcow2FSSession(ContextDecorator):
 
         for d in dirs:
            yield from self.walk(os.path.join(pathname, d))
+
+    def rdump(self, pv_mnt_dir, qcow2_dir='/'):
+        return self.send_cmd("rdump %s %s" % (qcow2_dir, pv_mnt_dir))
 
 
 def full_backup(pv_mnt, qcow2path):
@@ -292,13 +295,13 @@ if __name__ == "__main__":
     incr.add_argument('pv_mnt', help='Folder where the PV is mounted')
     incr.add_argument('qcow2image', help='Path to qcow2 image')
 
-    restore = subparsers.add_parser('restore', help='restore')
-    restore.add_argument('pv_mnt', help='Folder where the PV is mounted')
-    restore.add_argument('qcow2image', help='Path to qcow2 image')
+    restore_cmd = subparsers.add_parser('restore', help='restore')
+    restore_cmd.add_argument('pv_mnt', help='Folder where the PV is mounted')
+    restore_cmd.add_argument('qcow2image', help='Path to qcow2 image')
 
-    restore = subparsers.add_parser('compare', help='restore')
-    restore.add_argument('pv_mnt', help='Folder where the PV is mounted')
-    restore.add_argument('qcow2image', help='Path to qcow2 image')
+    compare_cmd = subparsers.add_parser('compare', help='compare')
+    compare_cmd.add_argument('pv_mnt', help='Folder where the PV is mounted')
+    compare_cmd.add_argument('qcow2image', help='Path to qcow2 image')
 
     args = parser.parse_args()
 
