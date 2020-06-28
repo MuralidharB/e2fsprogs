@@ -42,12 +42,17 @@ def execute(args):
 prog = "../build/qcow2fs/qcow2fs"
 
 class Qcow2FSSession(ContextDecorator):
-    def __init__(self, qcow2file):
+    def __init__(self, qcow2file, mode="r"):
         self.qcow2file = qcow2file
+        self.mode = mode
+        assert(mode in ["r", "rw"])
 
     def __enter__(self):
         env = os.environ.copy()
-        cmd = "%s %s" % (prog, self.qcow2file)
+        if self.mode == "r":
+            cmd = "%s %s" % (prog, self.qcow2file)
+        elif self.mode == "rw":
+            cmd = "%s -w %s" % (prog, self.qcow2file)
         self.process = Popen(cmd.split(), stdin=PIPE, stdout=PIPE,
                              stderr=subprocess.STDOUT, shell=False, env=env)
 
@@ -102,8 +107,8 @@ class Qcow2FSSession(ContextDecorator):
         for b in blocks:
             self.send_cmd("zap %s" % (str(b)))
 
-    def backup_file(self, src, dest):
-        pass
+    def backup_file(self, pv_mnt_file, qcow2_file_path):
+        return self.send_cmd("write %s %s" % (pv_mnt_file, qcow2_file_path))
 
     def delete_file(self, pathname):
         return self.send_cmd("rm %s" % (str(pathname)))
@@ -164,7 +169,7 @@ class Qcow2FSSession(ContextDecorator):
              self.makedirs(d)
     
         if not self.exists(pathname):
-            self.mkdir(self, pathname)
+            self.mkdir(pathname)
 
     def walk(self, pathname):
         ls_str = self.send_cmd("ls -l %s" % (str(pathname)))
@@ -207,7 +212,7 @@ def full_backup(pv_mnt, qcow2path):
 
 def incr_backup(pv_mnt, qcow2path):
     # copy modified or new files from prod pv to backup
-    with Qcow2FSSession(qcow2path) as session:
+    with Qcow2FSSession(qcow2path, "rw") as session:
         for path, dirs, files in os.walk(pv_mnt):
             print(path)
             for f in files:
@@ -225,6 +230,8 @@ def incr_backup(pv_mnt, qcow2path):
                         qcow2_st = session.stat_file(dst)
                         if pv_st.st_mtime != qcow2_st['st_mtime']:
                             session.backup_file(src, dst) 
+                    else:
+                        session.backup_file(src, dst) 
                 except Exception as ex:
                     print(ex)
 
