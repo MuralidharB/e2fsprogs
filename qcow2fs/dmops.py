@@ -108,7 +108,8 @@ class Qcow2FSSession(ContextDecorator):
             self.send_cmd("zap %s" % (str(b)))
 
     def backup_file(self, pv_mnt_file, qcow2_file_path):
-        return self.send_cmd("write %s %s" % (pv_mnt_file, qcow2_file_path))
+        self.send_cmd("cd %s" % os.path.split(qcow2_file_path)[0])
+        return self.send_cmd("write %s %s" % (pv_mnt_file, os.path.split(qcow2_file_path)[1]))
 
     def delete_file(self, pathname):
         return self.send_cmd("rm %s" % (str(pathname)))
@@ -144,7 +145,10 @@ class Qcow2FSSession(ContextDecorator):
         stat['mode'] = stat_str.split("\n")[0].split('Mode:')[1].split('Flags:')[0].strip()
 
         stat['user'] = int(stat_str.split("\n")[2].split('User:')[1].split('Group:')[0].strip())
-        stat['group'] = int(stat_str.split("\n")[2].split('Group:')[1].split('Size:')[0].strip())
+        if 'Project' in stat_str.split("\n")[2]:
+            stat['group'] = int(stat_str.split("\n")[2].split('Group:')[1].split('Project:')[0].strip())
+        else:
+            stat['group'] = int(stat_str.split("\n")[2].split('Group:')[1].split('Size:')[0].strip())
         stat['size'] = int(stat_str.split("\n")[2].split('Size:')[1].strip())
         return stat
 
@@ -163,7 +167,6 @@ class Qcow2FSSession(ContextDecorator):
             return False
 
     def makedirs(self, pathname):
-  
         d, f = os.path.split(pathname)
         if d != '/':
              self.makedirs(d)
@@ -214,7 +217,6 @@ def incr_backup(pv_mnt, qcow2path):
     # copy modified or new files from prod pv to backup
     with Qcow2FSSession(qcow2path, "rw") as session:
         for path, dirs, files in os.walk(pv_mnt):
-            print(path)
             for f in files:
                 try:
                     src = os.path.join(path, f)
@@ -250,7 +252,6 @@ def incr_backup(pv_mnt, qcow2path):
 
         # remove any files that are deleted since last backup
         for path, dirs, files in session.walk("/"):
-            print(path)
             for f in files:
                 try:    
                     src = os.path.join(path, f)
